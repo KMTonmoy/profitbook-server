@@ -57,7 +57,7 @@ app.use(
       process.env.CLIENT_URL || "",
     ].filter(Boolean),
     credentials: true,
-  })
+  }),
 );
 app.use(express.json({ limit: "10mb" }));
 
@@ -92,16 +92,19 @@ async function run() {
     const totalPaid = custSales.reduce((s, x) => s + (x.paid || 0), 0);
     const totalDue = custSales.reduce((s, x) => s + (x.due || 0), 0);
     const lastPurchaseDate = custSales.length
-      ? custSales.map((s) => s.date).sort().reverse()[0]
+      ? custSales
+          .map((s) => s.date)
+          .sort()
+          .reverse()[0]
       : null;
 
     try {
       await customers.updateOne(
         { _id: toObjectId(idStr) },
-        { $set: { totalPurchases, totalPaid, totalDue, lastPurchaseDate } }
+        { $set: { totalPurchases, totalPaid, totalDue, lastPurchaseDate } },
       );
     } catch {
-      // ignore
+      // ignore invalid id
     }
   }
 
@@ -121,13 +124,13 @@ async function run() {
       const qty = Number(item.quantity || 0);
       const newStock = Math.max(
         0,
-        (product.currentStock || 0) + direction * qty
+        (product.currentStock || 0) + direction * qty,
       );
       const newStatus = getStockStatus(newStock, product.minimumStock || 0);
 
       await products.updateOne(
         { _id: prodId },
-        { $set: { currentStock: newStock, status: newStatus } }
+        { $set: { currentStock: newStock, status: newStatus } },
       );
 
       await stockMovements.insertOne({
@@ -180,7 +183,7 @@ async function run() {
       const result = await categories.findOneAndUpdate(
         { _id },
         { $set: update },
-        { returnDocument: "after" }
+        { returnDocument: "after" },
       );
       if (!result) return res.status(404).json({ error: "Category not found" });
       res.json(serialize(result));
@@ -332,7 +335,7 @@ async function run() {
       const result = await products.findOneAndUpdate(
         { _id },
         { $set: update },
-        { returnDocument: "after" }
+        { returnDocument: "after" },
       );
       res.json(serialize(result));
     } catch (err) {
@@ -393,7 +396,7 @@ async function run() {
       const result = await suppliers.findOneAndUpdate(
         { _id },
         { $set: update },
-        { returnDocument: "after" }
+        { returnDocument: "after" },
       );
       if (!result) return res.status(404).json({ error: "Supplier not found" });
       res.json(serialize(result));
@@ -492,7 +495,7 @@ async function run() {
       const result = await customers.findOneAndUpdate(
         { _id },
         { $set: update },
-        { returnDocument: "after" }
+        { returnDocument: "after" },
       );
       if (!result) return res.status(404).json({ error: "Customer not found" });
       res.json(serialize(result));
@@ -561,12 +564,25 @@ async function run() {
         }
       }
 
+      const customerIdStr = String(customerId);
+      const cleanItems = items.map((it) => ({
+        id: it.id ? String(it.id) : `item-${new ObjectId().toString()}`,
+        productId: String(it.productId),
+        productName: String(it.productName || ""),
+        quantity: Number(it.quantity) || 0,
+        sellingPrice: Number(it.sellingPrice) || 0,
+        purchasePrice: Number(it.purchasePrice) || 0,
+        discount: Number(it.discount) || 0,
+        subtotal: Number(it.subtotal) || 0,
+        profit: Number(it.profit) || 0,
+      }));
+
       const doc = {
         invoiceNumber,
-        customerId: customerId.toString(),
+        customerId: customerIdStr,
         customerName: customerName || null,
         date,
-        items,
+        items: cleanItems,
         subtotal: Number(subtotal || 0),
         discount: Number(discount || 0),
         total: Number(total || 0),
@@ -581,11 +597,12 @@ async function run() {
       const result = await sales.insertOne(doc);
       const saleId = result.insertedId;
 
-      await adjustStock(items, -1, invoiceNumber);
+      await adjustStock(cleanItems, -1, invoiceNumber);
 
       if (doc.due > 0) {
+        const dueStatus = doc.due >= doc.total ? "unpaid" : "partial";
         await dues.insertOne({
-          customerId: doc.customerId,
+          customerId: customerIdStr,
           customerName: doc.customerName,
           saleId: saleId.toString(),
           invoiceNumber,
@@ -594,15 +611,16 @@ async function run() {
           paid: doc.paid,
           due: doc.due,
           dueDate: doc.dueDate,
-          status: "unpaid",
+          status: dueStatus,
           createdAt: new Date().toISOString(),
         });
       }
 
-      await recomputeCustomer(doc.customerId);
+      await recomputeCustomer(customerIdStr);
 
       res.status(201).json(serialize({ _id: saleId, ...doc }));
     } catch (err) {
+      console.error("POST /api/sales failed:", err);
       res.status(err.status || 500).json({ error: err.message });
     }
   });
@@ -632,12 +650,24 @@ async function run() {
         dueDate,
       } = req.body;
 
+      const cleanItems = (items ?? oldSale.items).map((it) => ({
+        id: it.id ? String(it.id) : `item-${new ObjectId().toString()}`,
+        productId: String(it.productId),
+        productName: String(it.productName || ""),
+        quantity: Number(it.quantity) || 0,
+        sellingPrice: Number(it.sellingPrice) || 0,
+        purchasePrice: Number(it.purchasePrice) || 0,
+        discount: Number(it.discount) || 0,
+        subtotal: Number(it.subtotal) || 0,
+        profit: Number(it.profit) || 0,
+      }));
+
       const update = {
         invoiceNumber: invoiceNumber ?? oldSale.invoiceNumber,
-        customerId: customerId ? customerId.toString() : oldSale.customerId,
+        customerId: customerId ? String(customerId) : oldSale.customerId,
         customerName: customerName ?? oldSale.customerName,
         date: date ?? oldSale.date,
-        items: items ?? oldSale.items,
+        items: cleanItems,
         subtotal: subtotal !== undefined ? Number(subtotal) : oldSale.subtotal,
         discount: discount !== undefined ? Number(discount) : oldSale.discount,
         total: total !== undefined ? Number(total) : oldSale.total,
@@ -652,6 +682,7 @@ async function run() {
       await adjustStock(update.items, -1, update.invoiceNumber);
 
       if (update.due > 0) {
+        const dueStatus = update.due >= update.total ? "unpaid" : "partial";
         await dues.insertOne({
           customerId: update.customerId,
           customerName: update.customerName,
@@ -662,7 +693,7 @@ async function run() {
           paid: update.paid,
           due: update.due,
           dueDate: update.dueDate,
-          status: "unpaid",
+          status: dueStatus,
           createdAt: new Date().toISOString(),
         });
       }
@@ -672,6 +703,7 @@ async function run() {
       const updated = await sales.findOne({ _id });
       res.json(serialize(updated));
     } catch (err) {
+      console.error("PATCH /api/sales failed:", err);
       res.status(err.status || 500).json({ error: err.message });
     }
   });
@@ -689,6 +721,7 @@ async function run() {
 
       res.json({ success: true, id: req.params.id });
     } catch (err) {
+      console.error("DELETE /api/sales failed:", err);
       res.status(err.status || 500).json({ error: err.message });
     }
   });
@@ -765,7 +798,7 @@ async function run() {
         const newStatus = getStockStatus(newStock, product.minimumStock || 0);
         await products.updateOne(
           { _id: product._id },
-          { $set: { currentStock: newStock, status: newStatus } }
+          { $set: { currentStock: newStock, status: newStatus } },
         );
         await stockMovements.insertOne({
           productId: product._id.toString(),
@@ -798,7 +831,7 @@ async function run() {
       const result = await purchases.findOneAndUpdate(
         { _id },
         { $set: update },
-        { returnDocument: "after" }
+        { returnDocument: "after" },
       );
       if (!result) return res.status(404).json({ error: "Purchase not found" });
       res.json(serialize(result));
@@ -863,7 +896,7 @@ async function run() {
       const result = await expenses.findOneAndUpdate(
         { _id },
         { $set: update },
-        { returnDocument: "after" }
+        { returnDocument: "after" },
       );
       if (!result) return res.status(404).json({ error: "Expense not found" });
       res.json(serialize(result));
@@ -955,7 +988,7 @@ async function run() {
       const result = await dues.findOneAndUpdate(
         { _id },
         { $set: update },
-        { returnDocument: "after" }
+        { returnDocument: "after" },
       );
       if (!result) return res.status(404).json({ error: "Due not found" });
       res.json(serialize(result));
@@ -1022,7 +1055,7 @@ async function run() {
 
           await dues.updateOne(
             { _id: relatedDue._id },
-            { $set: { paid: newPaid, due: newDue, status: newStatus } }
+            { $set: { paid: newPaid, due: newDue, status: newStatus } },
           );
         }
       }
@@ -1057,7 +1090,7 @@ async function run() {
 
           await dues.updateOne(
             { _id: relatedDue._id },
-            { $set: { paid: newPaid, due: newDue, status: newStatus } }
+            { $set: { paid: newPaid, due: newDue, status: newStatus } },
           );
         }
       }
@@ -1112,7 +1145,7 @@ async function run() {
 
       await products.updateOne(
         { _id: prodId },
-        { $set: { currentStock: newStock, status: newStatus } }
+        { $set: { currentStock: newStock, status: newStatus } },
       );
 
       const doc = {
@@ -1189,7 +1222,7 @@ async function run() {
         result = await settings.findOneAndUpdate(
           { _id: existing._id },
           { $set: update },
-          { returnDocument: "after" }
+          { returnDocument: "after" },
         );
       } else {
         const insertResult = await settings.insertOne({
@@ -1222,7 +1255,7 @@ async function run() {
 
       const totalSalesAmount = rangeSales.reduce(
         (s, x) => s + (x.total || 0),
-        0
+        0,
       );
       const totalSalesPaid = rangeSales.reduce((s, x) => s + (x.paid || 0), 0);
       const totalSalesDue = rangeSales.reduce((s, x) => s + (x.due || 0), 0);
@@ -1232,15 +1265,15 @@ async function run() {
 
       const totalPurchaseAmount = rangePurchases.reduce(
         (s, x) => s + (x.total || 0),
-        0
+        0,
       );
       const totalPurchasePaid = rangePurchases.reduce(
         (s, x) => s + (x.paid || 0),
-        0
+        0,
       );
       const totalPurchaseDue = rangePurchases.reduce(
         (s, x) => s + (x.due || 0),
-        0
+        0,
       );
       const totalPurchaseReturned = rangePurchases
         .filter((x) => x.status === "returned")
@@ -1248,13 +1281,13 @@ async function run() {
 
       const totalExpensesAmount = rangeExpenses.reduce(
         (s, x) => s + (x.amount || 0),
-        0
+        0,
       );
 
       const revenue = totalSalesAmount;
       const cogs = rangeSales.reduce(
         (s, x) => s + ((x.total || 0) - (x.profit || 0)),
-        0
+        0,
       );
       const grossProfit = revenue - cogs;
       const netProfit = grossProfit - totalExpensesAmount;
@@ -1271,7 +1304,7 @@ async function run() {
           (expenseByCategory[cat] || 0) + (e.amount || 0);
       }
       const byCategory = Object.entries(expenseByCategory).map(
-        ([category, amount]) => ({ category, amount })
+        ([category, amount]) => ({ category, amount }),
       );
 
       const dueOpening = 0;
@@ -1282,12 +1315,12 @@ async function run() {
       const allProducts = await products.find({}).toArray();
       const currentStockValue = allProducts.reduce(
         (s, p) => s + (p.currentStock || 0) * (p.purchasePrice || 0),
-        0
+        0,
       );
       const purchasedValue = totalPurchaseAmount;
       const soldValue = rangeSales.reduce(
         (s, x) => s + ((x.total || 0) - (x.profit || 0)),
-        0
+        0,
       );
 
       res.json({
@@ -1385,12 +1418,12 @@ async function run() {
       const revenue = rangeSales.reduce((s, x) => s + (x.total || 0), 0);
       const cogs = rangeSales.reduce(
         (s, x) => s + ((x.total || 0) - (x.profit || 0)),
-        0
+        0,
       );
       const grossProfit = revenue - cogs;
       const expensesTotal = rangeExpenses.reduce(
         (s, x) => s + (x.amount || 0),
-        0
+        0,
       );
       const netProfit = grossProfit - expensesTotal;
       const margin = revenue > 0 ? (netProfit / revenue) * 100 : 0;
@@ -1437,7 +1470,7 @@ async function run() {
         byCategoryMap[cat] = (byCategoryMap[cat] || 0) + (e.amount || 0);
       }
       const byCategory = Object.entries(byCategoryMap).map(
-        ([category, amount]) => ({ category, amount })
+        ([category, amount]) => ({ category, amount }),
       );
 
       res.json({ total, byCategory, entries: serializeArray(entries) });
@@ -1452,17 +1485,17 @@ async function run() {
       const totalProducts = allProducts.length;
       const totalUnits = allProducts.reduce(
         (s, p) => s + (p.currentStock || 0),
-        0
+        0,
       );
       const totalValue = allProducts.reduce(
         (s, p) => s + (p.currentStock || 0) * (p.purchasePrice || 0),
-        0
+        0,
       );
       const lowStock = allProducts.filter(
-        (p) => p.status === "low-stock"
+        (p) => p.status === "low-stock",
       ).length;
       const outOfStock = allProducts.filter(
-        (p) => p.status === "out-of-stock"
+        (p) => p.status === "out-of-stock",
       ).length;
 
       res.json({
@@ -1555,37 +1588,37 @@ async function run() {
       const totalSales = allSales.reduce((s, x) => s + (x.total || 0), 0);
       const totalPurchase = allPurchases.reduce(
         (s, x) => s + (x.total || 0),
-        0
+        0,
       );
       const totalProfit = allSales.reduce((s, x) => s + (x.profit || 0), 0);
       const totalDue = allCustomers.reduce((s, x) => s + (x.totalDue || 0), 0);
 
       const stockValue = allProducts.reduce(
         (s, p) => s + (p.currentStock || 0) * (p.purchasePrice || 0),
-        0
+        0,
       );
 
       const totalPaidAll = allSales.reduce((s, x) => s + (x.paid || 0), 0);
       const totalExpensesAll = allExpenses.reduce(
         (s, x) => s + (x.amount || 0),
-        0
+        0,
       );
       const cashBalance = totalPaidAll - totalExpensesAll;
 
       const last30Sales = allSales.filter(
-        (s) => s.date >= last30 && s.date <= todayD
+        (s) => s.date >= last30 && s.date <= todayD,
       );
       const prev30Sales = allSales.filter(
-        (s) => s.date >= prev30 && s.date < last30
+        (s) => s.date >= prev30 && s.date < last30,
       );
 
       const last30SalesTotal = last30Sales.reduce(
         (s, x) => s + (x.total || 0),
-        0
+        0,
       );
       const prev30SalesTotal = prev30Sales.reduce(
         (s, x) => s + (x.total || 0),
-        0
+        0,
       );
       const last30Profit = last30Sales.reduce((s, x) => s + (x.profit || 0), 0);
       const prev30Profit = prev30Sales.reduce((s, x) => s + (x.profit || 0), 0);
@@ -1601,10 +1634,10 @@ async function run() {
 
       const recentSalesCount = last30Sales.length;
       const lowStockCount = allProducts.filter(
-        (p) => (p.currentStock || 0) <= (p.minimumStock || 0)
+        (p) => (p.currentStock || 0) <= (p.minimumStock || 0),
       ).length;
       const dueCustomersCount = allCustomers.filter(
-        (c) => (c.totalDue || 0) > 0
+        (c) => (c.totalDue || 0) > 0,
       ).length;
 
       res.json({
@@ -1659,10 +1692,10 @@ async function run() {
           const mStr = monthStr(d);
 
           const monthSales = allSales.filter((s) =>
-            (s.date || "").startsWith(mStr)
+            (s.date || "").startsWith(mStr),
           );
           const monthPurchases = allPurchases.filter((p) =>
-            (p.date || "").startsWith(mStr)
+            (p.date || "").startsWith(mStr),
           );
 
           series.push({
